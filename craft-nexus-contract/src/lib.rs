@@ -3966,6 +3966,10 @@ impl EscrowContract {
                     escrow.status = EscrowStatus::Released;
                     env.storage().persistent().set(&(ESCROW, order_id), &escrow);
 
+                    // Decrement active counts
+                    Self::update_active_obligations(&env, &escrow.buyer, -1);
+                    Self::update_active_obligations(&env, &escrow.seller, -1);
+
                     // Transfer platform fee to platform wallet
                     if fee_amount > 0 {
                         Self::transfer_platform_fee(
@@ -4159,9 +4163,9 @@ impl EscrowContract {
         escrow.status = EscrowStatus::Resolved;
         env.storage().persistent().set(&(ESCROW, order_id), &escrow);
 
-        // Clean up any orphaned partial refund proposal
-        let proposal_key = DataKey::PartialRefundProposal(order_id);
-        env.storage().persistent().remove(&proposal_key);
+        // Decrement active counts
+        Self::update_active_obligations(&env, &escrow.buyer, -1);
+        Self::update_active_obligations(&env, &escrow.seller, -1);
 
         // Now perform token transfers (external calls)
         let token_client = token::Client::new(&env, &escrow.token);
