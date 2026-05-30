@@ -1385,3 +1385,190 @@ fn test_error_enum_backward_compatibility() {
     assert_eq!(Error::ReleaseWindowTooShort as u32, 23);
     assert_eq!(Error::StakeTokenMismatch as u32, 24);
 }
+
+// ============================================================
+// Issue #504 / #508 – bump_user_profile_ttl / bump_user_metrics_ttl (#103 / #107)
+// ============================================================
+
+/// bump_user_profile_ttl returns true when the profile exists.
+#[test]
+fn test_bump_user_profile_ttl_returns_true_when_present() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin) = setup_test(&env);
+    let user = Address::generate(&env);
+    client.onboard_user(&user, &String::from_str(&env, "ttl_user1"), &UserRole::Artisan);
+
+    let refreshed = client.bump_user_profile_ttl(&user);
+    assert!(refreshed);
+}
+
+/// bump_user_profile_ttl returns false for an address that was never onboarded.
+#[test]
+fn test_bump_user_profile_ttl_returns_false_when_absent() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin) = setup_test(&env);
+    let unknown = Address::generate(&env);
+
+    let refreshed = client.bump_user_profile_ttl(&unknown);
+    assert!(!refreshed);
+}
+
+/// bump_user_metrics_ttl returns true when metrics have been recorded.
+#[test]
+fn test_bump_user_metrics_ttl_returns_true_when_present() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin) = setup_test(&env);
+    let user = Address::generate(&env);
+    client.onboard_user(&user, &String::from_str(&env, "ttl_user2"), &UserRole::Artisan);
+
+    let token_admin = Address::generate(&env);
+    let token = env.register_stellar_asset_contract_v2(token_admin);
+    client.update_user_metrics(&user, &1u32, &1_000_000i128, &token.address());
+
+    let refreshed = client.bump_user_metrics_ttl(&user);
+    assert!(refreshed);
+}
+
+/// bump_user_metrics_ttl returns false when no metrics entry exists yet.
+#[test]
+fn test_bump_user_metrics_ttl_returns_false_when_absent() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin) = setup_test(&env);
+    let user = Address::generate(&env);
+    client.onboard_user(&user, &String::from_str(&env, "ttl_user3"), &UserRole::Buyer);
+
+    let refreshed = client.bump_user_metrics_ttl(&user);
+    assert!(!refreshed);
+}
+
+/// Unauthorized caller cannot invoke bump_user_profile_ttl.
+#[test]
+#[should_panic]
+fn test_bump_user_profile_ttl_rejects_unauthorized() {
+    let env = Env::default();
+    // No mock_all_auths — auth will not be satisfied.
+
+    let contract_id = env.register_contract(None, OnboardingContract);
+    let client = OnboardingContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    env.mock_all_auths();
+    client.initialize(&admin);
+    env.set_auths(&[]);
+
+    let user = Address::generate(&env);
+    // Should panic: no authorized escrow contract or admin signature provided.
+    client.bump_user_profile_ttl(&user);
+}
+
+/// Unauthorized caller cannot invoke bump_user_metrics_ttl.
+#[test]
+#[should_panic]
+fn test_bump_user_metrics_ttl_rejects_unauthorized() {
+    let env = Env::default();
+
+    let contract_id = env.register_contract(None, OnboardingContract);
+    let client = OnboardingContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    env.mock_all_auths();
+    client.initialize(&admin);
+    env.set_auths(&[]);
+
+    let user = Address::generate(&env);
+    // Should panic: no authorized escrow contract or admin signature provided.
+    client.bump_user_metrics_ttl(&user);
+}
+
+// ============================================================
+// Issue #506 – request_verification role guard (#105)
+// ============================================================
+
+/// Admin-role users cannot request manual verification through the queue.
+#[test]
+#[should_panic]
+fn test_request_verification_rejects_admin_role() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin) = setup_test(&env);
+    // The admin is onboarded with UserRole::Admin during initialize.
+    // Attempting to request verification should fail the role guard.
+    client.request_verification(&admin);
+}
+
+/// Moderator-role users cannot request manual verification through the queue.
+#[test]
+#[should_panic]
+fn test_request_verification_rejects_moderator_role() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin) = setup_test(&env);
+    let user = Address::generate(&env);
+    client.onboard_user(&user, &String::from_str(&env, "mod_user"), &UserRole::Buyer);
+    client.set_moderator(&user);
+
+    // After promotion to Moderator the role guard must reject the call.
+    client.request_verification(&user);
+}
+
+/// Buyer-role users can still request verification after the role guard is in place.
+#[test]
+fn test_request_verification_allows_buyer() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin) = setup_test(&env);
+    let user = Address::generate(&env);
+    client.onboard_user(&user, &String::from_str(&env, "buyer_verify"), &UserRole::Buyer);
+
+    client.request_verification(&user);
+    let queue = client.get_verification_queue();
+    assert_eq!(queue.len(), 1);
+}
+
+// ============================================================
+// Issue #510 – get_verification_history auth guard (#109)
+// ============================================================
+
+/// Calling get_verification_history without authorization panics.
+#[test]
+#[should_panic]
+fn test_get_verification_history_rejects_unauthenticated() {
+    let env = Env::default();
+
+    let contract_id = env.register_contract(None, OnboardingContract);
+    let client = OnboardingContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    env.mock_all_auths();
+    client.initialize(&admin);
+    env.set_auths(&[]);
+
+    let user = Address::generate(&env);
+    // Should panic: user.require_auth() cannot be satisfied.
+    client.get_verification_history(&user);
+}
+
+/// The user themselves can read their own verification history.
+#[test]
+fn test_get_verification_history_allows_authenticated_user() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin) = setup_test(&env);
+    let user = Address::generate(&env);
+    client.onboard_user(&user, &String::from_str(&env, "hist_auth"), &UserRole::Artisan);
+
+    client.request_verification(&user);
+    client.process_verification_request(&user, &true);
+
+    let history = client.get_verification_history(&user);
+    assert!(history.len() >= 2);
+}

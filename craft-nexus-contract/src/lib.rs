@@ -165,8 +165,6 @@ const MAX_UPGRADE_HISTORY: u32 = 32;
 const UPGRADE_PROPOSED: Symbol = symbol_short!("UPG_PROP");
 const UPGRADE_CANCELLED: Symbol = symbol_short!("UPG_CANC");
 const UPGRADE_EXECUTED: Symbol = symbol_short!("UPG_EXEC");
-const ONBOARD_CALL_FAILED: Symbol = symbol_short!("OB_FAIL");
-
 /// Maximum number of stake history entries per artisan (bounded queue to prevent storage bloat) (#237)
 const MAX_STAKE_HISTORY_SIZE: u32 = 100;
 /// Threshold at which to trigger automatic pruning of old stake history entries (#237)
@@ -573,20 +571,6 @@ pub struct Metadata {
     pub category: String,
 }
 
-/// Test-only structure for batch escrow creation parameters
-#[cfg(test)]
-#[derive(Clone, Eq, PartialEq)]
-pub struct CreateEscrowParams {
-    pub buyer: Address,
-    pub seller: Address,
-    pub token: Address,
-    pub amount: i128,
-    pub order_id: u32,
-    pub release_window: Option<u32>,
-    pub ipfs_hash: Option<String>,
-    pub metadata_hash: Option<Bytes>,
-}
-
 /// Proposal record for a pending WASM upgrade.
 ///
 /// `upgrade_at` is the earliest ledger timestamp at which `execute_upgrade` may
@@ -846,6 +830,7 @@ pub struct CraftNexusContract;
 
 /// Alias and compatibility layers
 pub type EscrowContract = CraftNexusContract;
+#[allow(non_upper_case_globals)]
 pub const EscrowContract: CraftNexusContract = CraftNexusContract;
 pub type EscrowContractClient<'a> = CraftNexusContractClient<'a>;
 pub type CreateEscrowParams = EscrowCreateParams;
@@ -1441,10 +1426,6 @@ impl CraftNexusContract {
     /// failure. Reputation tracking is also emitted as events
     /// (`ReputationUpdateEvent`) so off-chain consumers can recover state if
     /// the cross-contract call fails (#211).
-    fn get_onboarding_client(env: &Env) -> Option<OnboardingClient<'_>> {
-        Self::get_onboarding_address(env).map(|addr| OnboardingClient::new(env, &addr))
-    }
-
     /// Public read-only accessor for the registered onboarding contract
     /// address. Returns `OnboardingContractNotSet` rather than `None` so that
     /// SDK clients receive a typed error instead of a silent unwrap on a
@@ -1864,7 +1845,7 @@ impl CraftNexusContract {
             env.panic_with_error(Error::InvalidAdminAddress);
         }
 
-        let previous_admin = config.admin.clone();
+        let _previous_admin = config.admin.clone();
         config.admin = pending.clone();
         config.pending_admin = None;
 
@@ -4714,7 +4695,7 @@ impl CraftNexusContract {
 
         // Use per-deposit queue: only matured deposits can be unstaked.
         let queue_key = DataKey::ArtisanStakeQueue(artisan.clone());
-        let mut queue: soroban_sdk::Vec<StakeDeposit> = env
+        let queue: soroban_sdk::Vec<StakeDeposit> = env
             .storage()
             .persistent()
             .get(&queue_key)
