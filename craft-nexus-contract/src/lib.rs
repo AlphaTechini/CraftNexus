@@ -115,6 +115,7 @@ const ESCROW: Symbol = symbol_short!("ESCROW");
 const PLATFORM_FEE: Symbol = symbol_short!("PLAT_FEE");
 const PLATFORM_WALLET: Symbol = symbol_short!("PLAT_WAL");
 const TOTAL_FEES: Symbol = symbol_short!("TOT_FEES");
+const ADMIN: Symbol = symbol_short!("ADMIN");
 
 /// Standard TTL threshold for persistent storage (approx 14 hours at 5s ledger)
 const TTL_THRESHOLD: u32 = 10_000;
@@ -164,8 +165,6 @@ const MAX_UPGRADE_HISTORY: u32 = 32;
 const UPGRADE_PROPOSED: Symbol = symbol_short!("UPG_PROP");
 const UPGRADE_CANCELLED: Symbol = symbol_short!("UPG_CANC");
 const UPGRADE_EXECUTED: Symbol = symbol_short!("UPG_EXEC");
-const ONBOARD_CALL_FAILED: Symbol = symbol_short!("OB_FAIL");
-
 /// Maximum number of stake history entries per artisan (bounded queue to prevent storage bloat) (#237)
 const MAX_STAKE_HISTORY_SIZE: u32 = 100;
 /// Threshold at which to trigger automatic pruning of old stake history entries (#237)
@@ -187,6 +186,7 @@ pub enum DataKey {
     MinEscrowAmount(Address),
     TotalFees(Address),
     FeeTokenIndex,
+    FeeTokenConfig(Address),
     ContractVersion,
     /// Platform configuration storage key
     PlatformConfig,
@@ -238,10 +238,15 @@ pub enum DataKey {
     OnboardingContractAddress,
     /// Map of whitelisted token addresses (Address -> bool); enforcement active when non-empty
     WhitelistedTokens,
-    /// Ordered list of all escrow order IDs ever created (Vec<u32>); used for off-chain enumeration
+    /// DEPRECATED: Legacy monolithic Vec of all escrow order IDs.
+    /// New writes use [`DataKey::GlobalEscrowIdIndexed`] (#515). Kept for
+    /// lazy migration on the next index update or paginated read.
     AllEscrowIds,
-    /// Total count of escrows ever created; lightweight O(1) alternative to AllEscrowIds.len()
+    /// Total count of escrows ever created; O(1) length for indexed enumeration
     EscrowCount,
+    /// Indexed global escrow order ID by creation sequence (#515).
+    /// Each entry stores one `u32` order ID, avoiding Vec rewrites on batch create.
+    GlobalEscrowIdIndexed(u32),
     /// Fallback admin address for recovery if primary admin storage is corrupted (#240)
     FallbackAdmin,
     /// Timestamp when admin recovery mechanism becomes available (time-lock safety)
@@ -283,6 +288,14 @@ pub struct ArtisanStakeData {
 }
 
 #[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub struct StakeDeposit {
+    pub amount: i128,
+    pub cooldown_end: u64,
+}
+
+#[contracttype]
 #[derive(Clone, Copy, Eq, PartialEq)]
 #[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
 #[repr(u32)]
@@ -290,6 +303,23 @@ pub enum RecurringEscrowAction {
     Created = 0,
     CycleReleased = 1,
     Cancelled = 2,
+}
+
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub struct RecurringEscrow {
+    pub id: u64,
+    pub buyer: Address,
+    pub artisan: Address,
+    pub token: Address,
+    pub total_amount: i128,
+    pub released_amount: i128,
+    pub frequency: u64,
+    pub duration: u32,
+    pub current_cycle: u64,
+    pub last_release_time: u64,
+    pub is_active: bool,
 }
 
 #[contracttype]
@@ -532,6 +562,15 @@ pub struct MetadataRevealProof {
     pub secret: Option<Bytes>,
 }
 
+/// Test-only metadata structure for simplified testing
+#[cfg(test)]
+#[derive(Clone, Eq, PartialEq)]
+pub struct Metadata {
+    pub title: String,
+    pub description: String,
+    pub category: String,
+}
+
 /// Proposal record for a pending WASM upgrade.
 ///
 /// `upgrade_at` is the earliest ledger timestamp at which `execute_upgrade` may
@@ -591,12 +630,36 @@ pub struct UpgradeRecord {
 /// global storage shape — new fields can be appended as `Option<T>` and read
 /// with safe fallbacks.
 ///
-/// `active` lets the admin disable a token without losing its accumulated
-/// totals (set false to stop counting future fees while preserving history).
-/// `custom_fee_bps` is reserved for a future multi-token fee mode; it is
-/// currently NOT consulted by `calculate_fee` to keep this change storage-only
-/// and avoid a behavior change. A follow-up issue can wire it into the fee
-/// calculation once the storage shape stabilizes in production.
+/// # Fields
+///
+/// * `active` - Boolean flag indicating whether this token is currently active for
+///   platform fee collection. When false, the admin can disable a token without
+///   losing its accumulated totals, allowing history preservation while stopping
+///   future fee counting.
+///
+/// * `custom_fee_bps` - Optional custom fee basis points specific to this token.
+///   Reserved for a future multi-token fee mode; currently NOT consulted by
+///   `calculate_fee` to keep this change storage-only and avoid behavior changes.
+///   A follow-up issue will wire this into fee calculation once the storage shape
+///   stabilizes in production.
+///
+/// * `accumulated` - Total fees accumulated in this token, measured in stroops.
+///   Monotonically increasing counter that preserves fee history across
+///   activation/deactivation cycles.
+///
+/// # Storage Side-effects
+///
+/// - Stored persistently under `DataKey::FeeTokenConfig(token_address)` with
+///   TTL extension on reads to prevent premature archival.
+/// - Updates to this struct trigger config refresh in affected escrow operations
+///   to ensure correct fee calculations based on token status.
+///
+/// # Integration notes
+///
+/// Off-chain integrators should cache this struct keyed by token address and
+/// refresh on-demand when escrow operations reference new tokens. The `accumulated`
+/// field provides audit trail for fee reconciliation; timestamp context is
+/// available via escrow event logs.
 #[contracttype]
 #[derive(Clone, Eq, PartialEq)]
 #[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
@@ -614,7 +677,6 @@ pub struct FeeTokenInfo {
 #[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
 pub struct VersionInfo {
     pub current_version: u32,
-    pub latest_upgrade: Option<UpgradeRecord>,
     pub upgrade_count: u32,
 }
 
@@ -634,19 +696,44 @@ pub struct EscrowCreateParams {
 }
 
 /// Policy for handling fees when a dispute expires without arbitrator resolution.
-/// Determines whether the platform still collects a fee and from whom.
+///
+/// A dispute "expires" when the configured `max_dispute_duration` elapses
+/// without the arbitrator delivering a verdict (see [`PlatformConfig`]).
+/// At that point the escrow must still be unwound — but the platform fee
+/// is suddenly ambiguous: nobody won the dispute, so the usual "loser
+/// pays the fee" rule doesn't apply. This enum is the on-chain knob the
+/// admin uses to pick a policy at configuration time.
+///
+/// # Indexer / off-chain integration
+///
+/// Each variant is serialised as its `repr(u32)` discriminant on the
+/// wire, so off-chain indexers can match against `0..=3` without binding
+/// to the variant names. The discriminants are stable; reordering them
+/// would be a breaking change for existing escrows whose `PlatformConfig`
+/// has been persisted on-chain.
 #[contracttype]
 #[derive(Clone, Copy, Eq, PartialEq)]
 #[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
 pub enum ExpiredDisputeFeePolicy {
-    /// Refund buyer in full, platform collects no fee (default, buyer-friendly)
+    /// Refund buyer in full, platform collects no fee. The default,
+    /// buyer-friendly policy — the platform absorbs the cost of the
+    /// arbitrator timing out. Use when buyer goodwill matters more than
+    /// covering operational cost on stalled disputes.
     RefundFullNoPlatformFee = 0,
-    /// Refund buyer minus platform fee, platform collects fee from buyer
+    /// Refund buyer minus platform fee. The platform still earns its
+    /// fee, taken from the buyer's refunded amount. Symmetric to a
+    /// normal "buyer loses" resolution; use when the platform must
+    /// cover its costs regardless of dispute outcome.
     RefundMinusPlatformFee = 1,
-    /// Refund buyer in full, deduct platform fee from seller's locked amount
-    /// (seller loses fee even though they didn't receive payment)
+    /// Refund buyer in full, deduct platform fee from the seller's
+    /// locked amount. The seller forfeits the fee even though they
+    /// never received payment — use when seller responsibility for
+    /// presenting evidence outweighs the cost of forfeiting on a
+    /// stalled arbitration.
     DeductFeeFromSeller = 2,
-    /// Split the platform fee: half from buyer's refund, half from seller
+    /// Split the platform fee: half deducted from the buyer's refund,
+    /// half from the seller's locked amount. The most "neutral" policy
+    /// — both sides share the cost of the arbitrator timing out.
     SplitFee = 3,
 }
 
@@ -686,8 +773,67 @@ pub struct PartialRefundProposal {
     pub proposed_at: u64,
 }
 
+/// User roles in the CraftNexus platform
+#[contracttype]
+#[derive(Copy, Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub enum UserRole {
+    None = 0,      // User has not onboarded
+    Buyer = 1,     // Can purchase items
+    Artisan = 2,   // Can sell items and create escrow
+    Admin = 3,     // Platform administrator
+    Moderator = 4, // Can help manage disputes
+}
+
+/// Profile status for users
+#[contracttype]
+#[derive(Copy, Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub enum ProfileStatus {
+    Active = 0,
+    Deactivated = 1,
+}
+
+/// Onboarding status for users
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub struct UserProfile {
+    pub version: u32,
+    pub address: Address,
+    pub role: UserRole,
+    pub username: String,
+    pub registered_at: u64,
+    pub is_verified: bool,
+    /// Count of escrows where this user was on the winning side (#100)
+    pub successful_trades: u32,
+    /// Count of escrows that ended in a dispute against this user (#100)
+    pub disputed_trades: u32,
+    /// Portfolio CID for artisan showcase (IPFS) - Issue #112
+    pub portfolio_cid: Option<String>,
+    /// Status of the user profile - Issue #113
+    pub status: ProfileStatus,
+}
+
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub struct LegacyUserProfile {
+    pub address: Address,
+    pub role: UserRole,
+    pub username: String,
+    pub registered_at: u64,
+    pub is_verified: bool,
+    /// Count of escrows where this user was on the winning side (#100)
+    pub successful_trades: u32,
+    /// Count of escrows that ended in a dispute against this user (#100)
+    pub disputed_trades: u32,
+    /// Portfolio CID for artisan showcase (IPFS) - Issue #112
+    pub portfolio_cid: Option<String>,
+}
+
 /// Minimal cross-contract interface for the OnboardingContract.
-/// Used by EscrowContract to update user reputation and activity metrics
+/// Used by CraftNexusContract to update user reputation and activity metrics
 /// when escrow state changes (release, refund, resolve).
 #[soroban_sdk::contractclient(name = "OnboardingClient")]
 pub trait OnboardingInterface {
@@ -699,12 +845,43 @@ pub trait OnboardingInterface {
         volume_delta: i128,
         token_address: Address,
     );
+    fn deactivate_profile(env: Env, user: Address);
+    fn verify_user(env: Env, user: Address) -> UserProfile;
+    fn has_active_contracts(env: Env, user: Address) -> bool;
 }
+
 #[contract]
-pub struct EscrowContract;
+pub struct CraftNexusContract;
+
+/// Alias and compatibility layers
+pub type EscrowContract = CraftNexusContract;
+
+pub type EscrowContractClient<'a> = CraftNexusContractClient<'a>;
+
+/// Guard to ensure reentry protection is cleared even if a panic or error occurs.
+/// This is essential to prevent contract locks from persisting across failed calls.
+/// Automatically removes the guard when dropped, ensuring cleanup in all control flows.
+#[allow(dead_code)]
+struct ReentryGuardScope<'a> {
+    env: &'a Env,
+}
+
+#[allow(dead_code)]
+impl<'a> ReentryGuardScope<'a> {
+    fn new(env: &'a Env) -> Self {
+        CraftNexusContract::enter_reentry_guard(env);
+        ReentryGuardScope { env }
+    }
+}
+
+impl<'a> Drop for ReentryGuardScope<'a> {
+    fn drop(&mut self) {
+        CraftNexusContract::exit_reentry_guard(self.env);
+    }
+}
 
 #[contractimpl]
-impl EscrowContract {
+impl CraftNexusContract {
     /// Validate IPFS CID format (v0 and v1 with multibase prefixes).
     ///
     /// Supports:
@@ -722,7 +899,20 @@ impl EscrowContract {
         cid.copy_into_slice(&mut buf[0..len]);
         let cid_bytes = &buf[0..len];
 
-        // CIDv0: exactly 46 chars, starts with "Qm", Base58btc alphabet
+        // CIDv0: exactly 46 chars, starts with "Qm", Base58btc alphabet.
+        //
+        // Issue #521 — the Base58btc alphabet explicitly EXCLUDES
+        // visually-confusable characters: `0` (zero), `O` (capital o),
+        // `I` (capital i), and `l` (lowercase L). The ranges below are
+        // the canonical Base58btc set:
+        //   1..=9               (no leading 0)
+        //   A..=H, J..=N, P..=Z (no I, no O)
+        //   a..=k, m..=z        (no l)
+        // A CIDv0 hash is always 32 bytes of multihash digest →
+        // 46 Base58btc characters. Off-chain indexers that need to
+        // resolve a CIDv0 reference should pin it via an IPFS gateway
+        // such as `https://ipfs.io/ipfs/<CID>` or by talking to a
+        // dedicated cluster (Pinata, web3.storage).
         let is_v0 = len == 46
             && cid_bytes[0] == b'Q'
             && cid_bytes[1] == b'm'
@@ -801,6 +991,17 @@ impl EscrowContract {
         }
     }
 
+    /// Validate an optional IPFS CID string, panicking with `InvalidIpfsHash` if present but invalid.
+    ///
+    /// # Arguments
+    /// * `env` - The contract environment
+    /// * `ipfs_hash` - Optional CID string to validate
+    ///
+    /// # Errors
+    /// Panics with `Error::InvalidIpfsHash` if the CID is present but fails `validate_ipfs_cid`.
+    ///
+    /// # Storage side-effects
+    /// None — this is a pure validation helper with no storage reads or writes.
     fn validate_optional_ipfs_hash(env: &Env, ipfs_hash: &Option<String>) {
         if let Some(cid) = ipfs_hash {
             if !Self::validate_ipfs_cid(cid) {
@@ -809,6 +1010,17 @@ impl EscrowContract {
         }
     }
 
+    /// Validate an optional metadata hash, panicking with `InvalidMetadataHash` if present but not 32 bytes.
+    ///
+    /// # Arguments
+    /// * `env` - The contract environment
+    /// * `metadata_hash` - Optional raw bytes to validate
+    ///
+    /// # Errors
+    /// Panics with `Error::InvalidMetadataHash` if the hash is present but its length is not exactly 32 bytes.
+    ///
+    /// # Storage side-effects
+    /// None — this is a pure validation helper with no storage reads or writes.
     fn validate_optional_metadata_hash(env: &Env, metadata_hash: &Option<Bytes>) {
         if let Some(hash) = metadata_hash {
             if hash.len() != 32 {
@@ -827,9 +1039,18 @@ impl EscrowContract {
     }
 
     /// Validates admin address to ensure it's not zero/default and is properly initialized (#240)
-    /// This prevents common configuration errors and hardens against corruption
+    /// This prevents common configuration errors and hardens against corruption.
+    ///
+    /// Storage-layout note: this validator sits on the hot path for any
+    /// admin-gated mutation. Checks are ordered cheapest-first so the
+    /// common case (a structurally valid candidate that differs from
+    /// the current contract address) returns without touching persistent
+    /// storage at all — a small but consistent gas saving across every
+    /// transfer / propose / accept_admin call.
     fn validate_admin_address(env: &Env, admin: &Address) -> Result<(), Error> {
-        // Ensure the address is not the default/zero address
+        // Ensure the address is not the contract's own address — a common
+        // misconfiguration that would lock the contract out of admin
+        // operations forever.
         let contract = env.current_contract_address();
         if admin == &contract {
             return Err(Error::InvalidAdminAddress);
@@ -875,6 +1096,8 @@ impl EscrowContract {
                 wasm_upgrade_cooldown: DEFAULT_WASM_UPGRADE_COOLDOWN,
                 max_dispute_duration: DEFAULT_MAX_DISPUTE_DURATION,
                 stake_cooldown: DEFAULT_STAKE_COOLDOWN,
+                expired_dispute_fee_policy: ExpiredDisputeFeePolicy::RefundFullNoPlatformFee,
+                min_release_window: DEFAULT_MIN_RELEASE_WINDOW,
             });
         }
 
@@ -900,7 +1123,7 @@ impl EscrowContract {
         Ok(())
     }
 
-    fn emit_escrow_created(env: &Env, event: EscrowCreatedEvent) {
+    fn emit_escrow_created(env: &Env, event: EscrowEvent) {
         env.events()
             .publish((Symbol::new(env, "escrow"), event.escrow_id), event);
     }
@@ -993,6 +1216,50 @@ impl EscrowContract {
 
     fn exit_reentry_guard(env: &Env) {
         env.storage().temporary().remove(&DataKey::ReentryGuard);
+    }
+
+    /// Atomically appends one escrow ID to the indexed global registry and
+    /// increments `EscrowCount` (#515 / Issue #226).
+    fn update_escrow_indices_atomic(env: &Env, order_id: u32) {
+        // Issue #515 — O(1) indexed append replaces monolithic AllEscrowIds Vec
+        // rewrites. Legacy Vec entries are migrated lazily on first touch.
+        Self::migrate_legacy_all_escrow_ids(env);
+
+        let count_key = DataKey::EscrowCount;
+        let count = Self::get_persistent_u32(env, &count_key);
+
+        let index_key = DataKey::GlobalEscrowIdIndexed(count);
+        env.storage().persistent().set(&index_key, &order_id);
+        Self::extend_persistent(env, &index_key);
+
+        env.storage().persistent().set(&count_key, &(count + 1));
+        Self::extend_persistent(env, &count_key);
+    }
+
+    /// Atomically appends escrow IDs to the indexed global registry for batch
+    /// operations (#515). Each ID is stored under its own key so batch creates
+    /// avoid rewriting a growing Vec.
+    fn update_escrow_indices_batch_atomic(env: &Env, order_ids: &soroban_sdk::Vec<u32>) {
+        if order_ids.is_empty() {
+            return;
+        }
+
+        Self::migrate_legacy_all_escrow_ids(env);
+
+        let count_key = DataKey::EscrowCount;
+        let mut count = Self::get_persistent_u32(env, &count_key);
+
+        for i in 0..order_ids.len() {
+            if let Some(id) = order_ids.get(i) {
+                let index_key = DataKey::GlobalEscrowIdIndexed(count);
+                env.storage().persistent().set(&index_key, &id);
+                Self::extend_persistent(env, &index_key);
+                count += 1;
+            }
+        }
+
+        env.storage().persistent().set(&count_key, &count);
+        Self::extend_persistent(env, &count_key);
     }
 
     // IMPORTANT: this validation is intentionally scoped to escrow creation-time
@@ -1111,6 +1378,50 @@ impl EscrowContract {
             .extend_ttl(key, TTL_THRESHOLD, TTL_EXTENSION);
     }
 
+    /// Read a persistent `u32` and extend its TTL when the key exists (#515).
+    fn get_persistent_u32(env: &Env, key: &DataKey) -> u32 {
+        let value = env.storage().persistent().get(key).unwrap_or(0u32);
+        if env.storage().persistent().has(key) {
+            Self::extend_persistent(env, key);
+        }
+        value
+    }
+
+    /// Migrate legacy `AllEscrowIds` Vec storage to indexed keys (#515).
+    fn migrate_legacy_all_escrow_ids(env: &Env) {
+        let legacy_key = DataKey::AllEscrowIds;
+        if !env.storage().persistent().has(&legacy_key) {
+            return;
+        }
+
+        let all_ids: soroban_sdk::Vec<u32> = env
+            .storage()
+            .persistent()
+            .get(&legacy_key)
+            .unwrap_or(soroban_sdk::Vec::new(env));
+
+        for i in 0..all_ids.len() {
+            if let Some(id) = all_ids.get(i) {
+                let index_key = DataKey::GlobalEscrowIdIndexed(i);
+                if !env.storage().persistent().has(&index_key) {
+                    env.storage().persistent().set(&index_key, &id);
+                    Self::extend_persistent(env, &index_key);
+                }
+            }
+        }
+
+        let count_key = DataKey::EscrowCount;
+        let stored_count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
+        if stored_count < all_ids.len() {
+            env.storage()
+                .persistent()
+                .set(&count_key, &(all_ids.len() as u32));
+            Self::extend_persistent(env, &count_key);
+        }
+
+        env.storage().persistent().remove(&legacy_key);
+    }
+
     /// Returns the configured maximum release window (in seconds).
     /// Falls back to MAX_TOTAL_RELEASE_WINDOW (30 days) if not set by admin.
     fn get_max_release_window(env: &Env) -> u32 {
@@ -1138,10 +1449,6 @@ impl EscrowContract {
     /// failure. Reputation tracking is also emitted as events
     /// (`ReputationUpdateEvent`) so off-chain consumers can recover state if
     /// the cross-contract call fails (#211).
-    fn get_onboarding_client(env: &Env) -> Option<OnboardingClient<'_>> {
-        Self::get_onboarding_address(env).map(|addr| OnboardingClient::new(env, &addr))
-    }
-
     /// Public read-only accessor for the registered onboarding contract
     /// address. Returns `OnboardingContractNotSet` rather than `None` so that
     /// SDK clients receive a typed error instead of a silent unwrap on a
@@ -1189,6 +1496,16 @@ impl EscrowContract {
         successful_delta: u32,
         disputed_delta: u32,
     ) -> bool {
+        // Issue #527 — short-circuit on the no-op call before paying
+        // for the persistent storage read of the onboarding contract
+        // address. If both reputation deltas are 0 the cross-contract
+        // call has no effect; returning `true` here saves a storage
+        // decode + a host `try_invoke_contract` on every escrow
+        // settlement where reputation didn't change.
+        if successful_delta == 0 && disputed_delta == 0 {
+            return true;
+        }
+
         let onboarding = match Self::get_onboarding_address(env) {
             Some(a) => a,
             None => return false,
@@ -1288,7 +1605,8 @@ impl EscrowContract {
         let old_min = config.min_release_window;
         config.min_release_window = min_window;
 
-        env.storage().instance().set(&DataKey::PlatformConfig, &config);
+        env.storage().persistent().set(&DataKey::PlatformConfig, &config);
+        Self::extend_persistent(&env, &DataKey::PlatformConfig);
 
         Self::emit_config_updated(
             &env,
@@ -1538,8 +1856,7 @@ impl EscrowContract {
 
         let previous_admin = config.admin.clone();
         config.pending_admin = Some(new_admin.clone());
-        env.storage().persistent().set(&PLATFORM_FEE, &config);
-        Self::extend_persistent(&env, &PLATFORM_FEE);
+        env.storage().instance().set(&DataKey::PlatformConfig, &config);
 
         // Emit audit event for admin change proposal
         Self::emit_admin_changed(&env, previous_admin, new_admin, "admin_proposed");
@@ -1558,7 +1875,7 @@ impl EscrowContract {
             env.panic_with_error(Error::InvalidAdminAddress);
         }
 
-        let previous_admin = config.admin.clone();
+        let _previous_admin = config.admin.clone();
         config.admin = pending.clone();
         config.pending_admin = None;
 
@@ -1645,8 +1962,7 @@ impl EscrowContract {
             env.panic_with_error(Error::InvalidAdminAddress);
         }
 
-        // Emit audit event for successful admin claim
-        Self::emit_admin_changed(&env, previous_admin, config.admin.clone(), "admin_claimed");
+        Ok(count)
     }
 
     /// Recover admin access using fallback admin after time lock period (#240)
@@ -1832,21 +2148,13 @@ impl EscrowContract {
         env.storage().persistent().set(&(ESCROW, order_id), &escrow);
         Self::extend_persistent(&env, &(ESCROW, order_id));
 
-        // Update global escrow index for off-chain enumeration
-        let ids_key = DataKey::AllEscrowIds;
-        let mut all_ids: soroban_sdk::Vec<u32> = env
-            .storage()
-            .persistent()
-            .get(&ids_key)
-            .unwrap_or(soroban_sdk::Vec::new(&env));
-        all_ids.push_back(order_id);
-        env.storage().persistent().set(&ids_key, &all_ids);
-        Self::extend_persistent(&env, &ids_key);
+        // Track active escrows
+        Self::update_active_obligations(&env, &buyer, 1);
+        Self::update_active_obligations(&env, &seller, 1);
 
-        let count_key = DataKey::EscrowCount;
-        let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0u32);
-        env.storage().persistent().set(&count_key, &(count + 1));
-        Self::extend_persistent(&env, &count_key);
+        // Update global escrow index for off-chain enumeration using atomic function
+        // This ensures AllEscrowIds and EscrowCount always remain in sync (Issue #226)
+        Self::update_escrow_indices_atomic(&env, order_id);
 
         // Update buyer's escrow list using indexed storage (scalable approach)
         let buyer_count_key = DataKey::BuyerEscrowCount(buyer.clone());
@@ -1882,10 +2190,6 @@ impl EscrowContract {
             .set(&seller_count_key, &(seller_count + 1));
         Self::extend_persistent(&env, &seller_count_key);
 
-        // Track active escrows for both parties
-        Self::update_active_obligations(&env, &buyer, 1);
-        Self::update_active_obligations(&env, &seller, 1);
-
         // Transfer funds from buyer to contract
         let client = token::Client::new(&env, &token);
         client.transfer(&buyer, &env.current_contract_address(), &amount);
@@ -1893,7 +2197,7 @@ impl EscrowContract {
         // Track locked funds (#212)
         Self::update_total_locked(&env, &token, amount);
 
-        Self::emit_escrow_event(
+        Self::emit_escrow_created(
             &env,
             EscrowEvent {
                 escrow_id: order_id as u64,
@@ -1989,7 +2293,7 @@ impl EscrowContract {
         Self::update_active_obligations(&env, &buyer, 1);
         Self::update_active_obligations(&env, &seller, 1);
 
-        Self::emit_escrow_event(
+        Self::emit_escrow_created(
             &env,
             EscrowEvent {
                 escrow_id: order_id as u64,
@@ -2024,7 +2328,7 @@ impl EscrowContract {
         // Track locked funds (#212)
         Self::update_total_locked(&env, &escrow.token, escrow.amount);
         
-        Self::emit_escrow_event(
+        Self::emit_escrow_created(
             &env,
             EscrowEvent {
                 escrow_id: order_id as u64,
@@ -2074,6 +2378,7 @@ impl EscrowContract {
         limit: u32,
         reverse: bool,
     ) -> Result<soroban_sdk::Vec<u64>, Error> {
+        buyer.require_auth();
         let mut result = soroban_sdk::Vec::new(&env);
 
         // Try new indexed storage first
@@ -2146,6 +2451,7 @@ impl EscrowContract {
         limit: u32,
         reverse: bool,
     ) -> Result<soroban_sdk::Vec<u64>, Error> {
+        seller.require_auth();
         let mut result = soroban_sdk::Vec::new(&env);
 
         // Try new indexed storage first
@@ -2641,7 +2947,7 @@ impl EscrowContract {
         // Track locked funds (#212)
         Self::update_total_locked(&env, &escrow.token, -escrow.amount);
 
-        Self::emit_escrow_event(
+        Self::emit_escrow_created(
             &env,
             EscrowEvent {
                 escrow_id: order_id as u64,
@@ -2730,7 +3036,7 @@ impl EscrowContract {
             &seller_amount,
         );
 
-        Self::emit_escrow_event(
+        Self::emit_escrow_created(
             &env,
             EscrowEvent {
                 escrow_id: order_id as u64,
@@ -2799,7 +3105,7 @@ impl EscrowContract {
         escrow.release_window = new_window;
         env.storage().persistent().set(&escrow_key, &escrow);
 
-        Self::emit_escrow_event(
+        Self::emit_escrow_created(
             &env,
             EscrowEvent {
                 escrow_id: order_id as u64,
@@ -3059,14 +3365,8 @@ impl EscrowContract {
         let current_version = Self::get_version(env.clone());
         let history = Self::get_upgrade_history(env);
         let upgrade_count = history.len();
-        let latest_upgrade = if upgrade_count == 0 {
-            None
-        } else {
-            history.get(upgrade_count - 1)
-        };
         VersionInfo {
             current_version,
-            latest_upgrade,
             upgrade_count,
         }
     }
@@ -3111,7 +3411,7 @@ impl EscrowContract {
         // Track locked funds (#212)
         Self::update_total_locked(&env, &escrow.token, -escrow.amount);
 
-        Self::emit_escrow_event(
+        Self::emit_escrow_created(
             &env,
             EscrowEvent {
                 escrow_id,
@@ -3220,8 +3520,6 @@ impl EscrowContract {
         proof: MetadataRevealProof,
         authorized_address: Address,
     ) -> bool {
-        authorized_address.require_auth();
-
         let escrow = Self::get_escrow(env.clone(), order_id);
         let config = Self::get_platform_config_internal(&env);
 
@@ -3325,7 +3623,7 @@ impl EscrowContract {
         escrow.dispute_initiated_at = Some(env.ledger().timestamp());
         env.storage().persistent().set(&(ESCROW, order_id), &escrow);
 
-        Self::emit_escrow_event(
+        Self::emit_escrow_created(
             &env,
             EscrowEvent {
                 escrow_id: order_id as u64,
@@ -3395,7 +3693,7 @@ impl EscrowContract {
             }
         }
 
-        Self::emit_escrow_event(
+        Self::emit_escrow_created(
             &env,
             EscrowEvent {
                 escrow_id: order_id as u64,
@@ -3764,7 +4062,7 @@ impl EscrowContract {
         // Track locked funds (#212)
         Self::update_total_locked(env, &params.token, params.amount);
 
-        Self::emit_escrow_event(
+        Self::emit_escrow_created(
             env,
             EscrowEvent {
                 escrow_id: params.order_id as u64,
@@ -3822,6 +4120,15 @@ impl EscrowContract {
     /// # Errors
     /// - BatchLimitExceeded if batch exceeds MAX_BATCH_SIZE
     /// - Any validation error from individual escrows
+    pub fn create_escrows_batch(
+        env: Env,
+        params: soroban_sdk::Vec<EscrowCreateParams>,
+    ) -> Result<soroban_sdk::Vec<u64>, Error> {
+        let batch_id = env.storage().instance().get(&Symbol::new(&env, "next_batch_id")).unwrap_or(1u64);
+        env.storage().instance().set(&Symbol::new(&env, "next_batch_id"), &(batch_id + 1));
+        Self::create_batch_escrow(env, batch_id, params)
+    }
+
     pub fn create_batch_escrow(
         env: Env,
         batch_id: u64,
@@ -3909,7 +4216,7 @@ impl EscrowContract {
                         let escrow_opt: Option<Escrow> =
                             env.storage().persistent().get(&(ESCROW, id as u32));
                         if let Some(escrow) = escrow_opt {
-                            Self::emit_escrow_event(
+                            Self::emit_escrow_created(
                                 &env,
                                 EscrowEvent {
                                     escrow_id: id,
@@ -3967,28 +4274,17 @@ impl EscrowContract {
             i += 1;
         }
 
-        // Consolidate global index updates for the entire batch
+        // Consolidate global index updates for the entire batch using atomic function
+        // This ensures AllEscrowIds and EscrowCount always remain in sync (Issue #226)
         if !results.is_empty() {
-            let ids_key = DataKey::AllEscrowIds;
-            let mut all_ids: soroban_sdk::Vec<u32> = env
-                .storage()
-                .persistent()
-                .get(&ids_key)
-                .unwrap_or(soroban_sdk::Vec::new(&env));
+            // Convert results to u32 order IDs
+            let mut order_ids = soroban_sdk::Vec::new(&env);
             for j in 0..results.len() {
                 if let Some(id) = results.get(j) {
-                    all_ids.push_back(id as u32);
+                    order_ids.push_back(id as u32);
                 }
             }
-            env.storage().persistent().set(&ids_key, &all_ids);
-            Self::extend_persistent(&env, &ids_key);
-
-            let count_key = DataKey::EscrowCount;
-            let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0u32);
-            env.storage()
-                .persistent()
-                .set(&count_key, &(count + results.len()));
-            Self::extend_persistent(&env, &count_key);
+            Self::update_escrow_indices_batch_atomic(&env, &order_ids);
         }
 
         Self::exit_reentry_guard(&env);
@@ -4084,7 +4380,7 @@ impl EscrowContract {
                     );
 
                     // Emit release event
-                    Self::emit_escrow_event(
+                    Self::emit_escrow_created(
                         &env,
                         EscrowEvent {
                             escrow_id: order_id as u64,
@@ -4327,7 +4623,7 @@ impl EscrowContract {
         // Track locked funds (#212)
         Self::update_total_locked(&env, &escrow.token, -escrow.amount);
 
-        Self::emit_escrow_event(
+        Self::emit_escrow_created(
             &env,
             EscrowEvent {
                 escrow_id: order_id as u64,
@@ -4387,7 +4683,7 @@ impl EscrowContract {
         Self::extend_persistent(&env, &stake_key);
 
         // Record stake operation in history queue for audit trail (#237)
-        if let Err(_) = Self::record_stake_history(&env, &artisan, new_stake, "stake_added") {
+        if let Err(_) = Self::record_stake_history(&env, &artisan, new_stake.amount, "stake_added") {
             env.panic_with_error(Error::StakeQueueFull);
         }
 
@@ -4396,14 +4692,27 @@ impl EscrowContract {
         let cooldown_key = DataKey::StakeCooldownEnd(artisan.clone());
         let existing_cooldown: u64 = env.storage().persistent().get(&cooldown_key).unwrap_or(0);
         
-        if existing_cooldown == 0 {
+        let cooldown_end = if existing_cooldown == 0 {
             // No existing cooldown, initialize new one
             let config = Self::get_platform_config_internal(&env);
-            let cooldown_end = env.ledger().timestamp() + config.stake_cooldown as u64;
-            env.storage().persistent().set(&cooldown_key, &cooldown_end);
+            let end = env.ledger().timestamp() + config.stake_cooldown as u64;
+            env.storage().persistent().set(&cooldown_key, &end);
             Self::extend_persistent(&env, &cooldown_key);
-        }
-        // If cooldown already exists, do NOT reset it - prevents gaming the system
+            end
+        } else {
+            existing_cooldown
+        };
+
+        // Push deposit entry to queue
+        let queue_key = DataKey::ArtisanStakeQueue(artisan.clone());
+        let mut queue: soroban_sdk::Vec<StakeDeposit> = env
+            .storage()
+            .persistent()
+            .get(&queue_key)
+            .unwrap_or(soroban_sdk::Vec::new(&env));
+        queue.push_back(StakeDeposit { amount, cooldown_end });
+        env.storage().persistent().set(&queue_key, &queue);
+        Self::extend_persistent(&env, &queue_key);
     }
 
     /// Unstake previously staked tokens after the cooldown period has elapsed.
@@ -4416,7 +4725,7 @@ impl EscrowContract {
 
         // Use per-deposit queue: only matured deposits can be unstaked.
         let queue_key = DataKey::ArtisanStakeQueue(artisan.clone());
-        let mut queue: soroban_sdk::Vec<StakeDeposit> = env
+        let queue: soroban_sdk::Vec<StakeDeposit> = env
             .storage()
             .persistent()
             .get(&queue_key)
@@ -4451,8 +4760,10 @@ impl EscrowContract {
         }
 
         // Clear stake metadata before returning the reserved artisan funds.
-        env.storage().persistent().set(&stake_key, &0i128);
-        env.storage().persistent().remove(&stake_token_key);
+        let stake_key = DataKey::ArtisanStake(artisan.clone());
+        let cooldown_key = DataKey::StakeCooldownEnd(artisan.clone());
+        env.storage().persistent().remove(&stake_key);
+        env.storage().persistent().remove(&DataKey::ArtisanStakeQueue(artisan.clone()));
         env.storage().persistent().remove(&cooldown_key);
 
         // Return matured tokens to artisan
@@ -4619,18 +4930,15 @@ impl EscrowContract {
     /// `get_all_escrow_ids_iterative` to paginate the full ID set without
     /// hitting Soroban CPU/memory resource limits.
     pub fn get_escrow_count(env: Env) -> u32 {
-        let key = DataKey::EscrowCount;
-        env.storage()
-            .persistent()
-            .get::<DataKey, u32>(&key)
-            .unwrap_or(0)
+        Self::migrate_legacy_all_escrow_ids(&env);
+        Self::get_persistent_u32(&env, &DataKey::EscrowCount)
     }
 
     /// Returns a page of all escrow order IDs created on the platform, in creation order.
     ///
     /// This is the recommended pattern for frontends to enumerate every escrow without
     /// hitting Soroban resource limits. The function reads a bounded slice of the
-    /// globally maintained `AllEscrowIds` index; no on-chain loops proportional to
+    /// indexed `GlobalEscrowIdIndexed` registry; no on-chain loops proportional to
     /// the total escrow count are performed at call time.
     ///
     /// # Usage pattern (frontend / off-chain)
@@ -4647,8 +4955,9 @@ impl EscrowContract {
     /// To enumerate storage keys directly via the RPC without calling this function,
     /// use the `getLedgerEntries` method or the experimental `getContractData` cursor
     /// endpoint.  Relevant key patterns:
-    /// - `DataKey::AllEscrowIds`           – the full ordered ID list (this index)
+    /// - `DataKey::GlobalEscrowIdIndexed(index)` – indexed global escrow ID (#515)
     /// - `DataKey::EscrowCount`            – u32 total count
+    /// - `DataKey::AllEscrowIds`           – DEPRECATED legacy Vec index
     /// - `(ESCROW, order_id: u32)`         – individual escrow struct
     /// - `DataKey::BuyerEscrows(address)`  – DEPRECATED: Legacy Vec<u64> of IDs for a buyer
     /// - `DataKey::SellerEscrows(address)` – DEPRECATED: Legacy Vec<u64> of IDs for a seller
@@ -4669,22 +4978,27 @@ impl EscrowContract {
             return soroban_sdk::Vec::new(&env);
         }
 
-        let key = DataKey::AllEscrowIds;
-        let all_ids: soroban_sdk::Vec<u32> = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .unwrap_or(soroban_sdk::Vec::new(&env));
+        Self::migrate_legacy_all_escrow_ids(&env);
 
+        let total = Self::get_persistent_u32(&env, &DataKey::EscrowCount);
         let start = page * limit;
-        let len = all_ids.len();
 
-        if start >= len {
+        if start >= total {
             return soroban_sdk::Vec::new(&env);
         }
 
-        let end = (start + limit).min(len);
-        all_ids.slice(start..end)
+        let end = (start + limit).min(total);
+        let mut result = soroban_sdk::Vec::new(&env);
+
+        for index in start..end {
+            let index_key = DataKey::GlobalEscrowIdIndexed(index);
+            if let Some(id) = env.storage().persistent().get(&index_key) {
+                result.push_back(id);
+                Self::extend_persistent(&env, &index_key);
+            }
+        }
+
+        result
     }
 
     /// Accept the outstanding partial refund proposal for a disputed escrow.
@@ -4772,7 +5086,7 @@ impl EscrowContract {
             Self::update_total_locked(&env, &escrow.token, -escrow.amount);
         }
 
-        Self::emit_escrow_event(
+        Self::emit_escrow_created(
             &env,
             EscrowEvent {
                 escrow_id: order_id as u64,
@@ -4961,7 +5275,7 @@ impl EscrowContract {
         if !escrow.is_active {
             env.panic_with_error(crate::Error::InvalidEscrowState);
         }
-        if escrow.current_cycle >= escrow.duration {
+        if escrow.current_cycle >= escrow.duration as u64 {
             env.panic_with_error(crate::Error::CycleNotReady);
         }
 
@@ -4970,7 +5284,7 @@ impl EscrowContract {
             env.panic_with_error(crate::Error::CycleNotReady);
         }
 
-        let cycle_amount = if escrow.current_cycle == escrow.duration - 1 {
+        let cycle_amount = if escrow.current_cycle == (escrow.duration as u64) - 1 {
             // Last cycle: handle remainder
             escrow.total_amount - escrow.released_amount
         } else {
@@ -5002,7 +5316,7 @@ impl EscrowContract {
         escrow.current_cycle += 1;
         escrow.last_release_time = now;
 
-        if escrow.current_cycle == escrow.duration {
+        if escrow.current_cycle == escrow.duration as u64 {
             escrow.is_active = false;
             // Decrement active recurring counts
             Self::update_active_obligations(&env, &escrow.buyer, -1);
