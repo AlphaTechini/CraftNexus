@@ -3,6 +3,8 @@
 //! Handles user registration (onboarding), role assignments, username configuration,
 //! profile management, and verification processes for buyers and artisans on the CraftNexus platform.
 
+#![allow(unexpected_cfgs)]
+
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, token, Address, Env, Map, String, Symbol,
     TryFromVal, Val, Vec,

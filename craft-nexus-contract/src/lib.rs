@@ -1,5 +1,6 @@
 #![no_std]
 #![allow(clippy::too_many_arguments)]
+#![allow(unexpected_cfgs)]
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Bytes,
     BytesN, Env, IntoVal, Map, String, Symbol, TryFromVal, Val, Vec,
@@ -33,7 +34,7 @@ pub enum Error {
     EscrowNotFound = 2,
     /// Invalid escrow state for operation
     InvalidEscrowState = 3,
-    /// Username already exists
+    /// DEPRECATED: Handled by onboarding contract. Retained for ABI compatibility.
     UsernameAlreadyExists = 4,
     /// Token not whitelisted
     TokenNotWhitelisted = 5,
@@ -43,7 +44,7 @@ pub enum Error {
     ReleaseWindowTooLong = 7,
     /// Not in dispute state
     NotInDispute = 8,
-    /// User already onboarded
+    /// DEPRECATED: Handled by onboarding contract. Retained for ABI compatibility.
     AlreadyOnboarded = 9,
     /// Invalid fee amount (must be <= MAX_PLATFORM_FEE_BPS)
     InvalidFee = 10,
@@ -1433,7 +1434,7 @@ impl CraftNexusContract {
         let mut count = Self::get_whitelist_count(env);
         for (token, enabled) in legacy_whitelist.iter() {
             if enabled {
-                let token_key = DataKey::WhitelistedToken(token.clone());
+                let token_key = DataKey::WhitelistedTokenIndexed(token.clone());
                 if !env.storage().persistent().has(&token_key) {
                     env.storage().persistent().set(&token_key, &true);
                     Self::extend_persistent(env, &token_key);
@@ -1780,9 +1781,6 @@ impl CraftNexusContract {
             let count = Self::get_whitelist_count(&env);
             if count > 0 {
                 Self::set_whitelist_count(&env, count - 1);
-            }
-        }
-    }
             }
         }
     }
