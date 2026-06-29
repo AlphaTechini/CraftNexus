@@ -1,13 +1,10 @@
 #![no_std]
 #![allow(clippy::too_many_arguments)]
-#![allow(unexpected_cfgs)]
-// use soroban_sdk::{
-//     contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Bytes,
-//     BytesN, Env, IntoVal, Map, String, Symbol, TryFromVal, Val, Vec,
-// };
+
+extern crate alloc;
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Bytes, BytesN, Env, IntoVal, Map, String, Symbol,
-    TryFromVal, Val, Vec,
+    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Bytes,
+    BytesN, Env, IntoVal, Map, String, Symbol, TryFromVal, Val, Vec,
 };
 
 #[cfg(test)]
@@ -270,7 +267,8 @@ pub enum DataKey {
     GlobalEscrowIdIndexed(u32),
     /// Fallback admin address for recovery if primary admin storage is corrupted (#240)
     FallbackAdmin,
-    /// Timestamp when admin recovery mechanism becomes available (time-lock safety)
+    /// Timestamp when admin recovery mechanism becomes available (time-lock safety).
+    /// Stored as a compact `u64` ledger timestamp (#431 / key index #30).
     AdminRecoveryTime,
     /// Historical record of stake changes per artisan (bounded queue for audit trail) (#237)
     StakeHistory(Address),
@@ -1600,6 +1598,17 @@ impl CraftNexusContract {
         }
     }
 
+    /// Read a persistent `u64` and extend its TTL when the key exists (#431 / key index #30).
+    fn get_persistent_u64(env: &Env, key: &DataKey) -> u64 {
+        match env.storage().persistent().get(key) {
+            Some(value) => {
+                Self::extend_persistent(env, key);
+                value
+            }
+            None => 0u64,
+        }
+    }
+
     fn get_whitelist_count(env: &Env) -> u32 {
         let count_key = DataKey::WhitelistedTokenCount;
         match env.storage().persistent().get(&count_key) {
@@ -2431,19 +2440,16 @@ impl CraftNexusContract {
         // Validate the recovery address
         Self::validate_admin_address(&env, &recovered_admin)?;
 
-        // Check if recovery time lock has passed
-        let recovery_time_key = DataKey::AdminRecoveryTime;
-        let recovery_time: u64 = env
-            .storage()
-            .persistent()
-            .get(&recovery_time_key)
-            .unwrap_or(0);
+        // Check if recovery time lock has passed (#431 — TTL-friendly read)
+        let recovery_time =
+            Self::get_persistent_u64(&env, &DataKey::AdminRecoveryTime);
 
         let current_time = env.ledger().timestamp();
 
         // If this is the first recovery request, initiate time lock
         if recovery_time == 0 {
             let new_recovery_time = current_time + ADMIN_RECOVERY_DELAY;
+            let recovery_time_key = DataKey::AdminRecoveryTime;
             env.storage()
                 .persistent()
                 .set(&recovery_time_key, &new_recovery_time);
@@ -2467,15 +2473,18 @@ impl CraftNexusContract {
 
         config.admin = recovered_admin.clone();
         config.pending_admin = None;
+        // Write config to instance storage (primary location) — TTL already extended
+        // by get_platform_config_internal. No redundant extend_persistent needed.
+        env.storage().instance().set(&DataKey::PlatformConfig, &config);
 
+        // Sync to persistent backup key for recovery consistency (no TTL extension needed
+        // since this is a one-time sync, not a read-heavy path).
         env.storage().persistent().set(&PLATFORM_FEE, &config);
-        Self::extend_persistent(&env, &PLATFORM_FEE);
-
-        env.storage().persistent().set(&ADMIN, &config.admin);
-        Self::extend_persistent(&env, &ADMIN);
 
         // Clear the recovery time lock for next cycle
-        env.storage().persistent().remove(&recovery_time_key);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::AdminRecoveryTime);
 
         // Emit audit event
         Self::emit_admin_changed(&env, previous_admin, recovered_admin, "admin_recovered");
@@ -3051,8 +3060,8 @@ impl CraftNexusContract {
             let slice_len = core::cmp::min(len, 32);
             let mut buf = [0u8; 32];
             r.copy_into_slice(&mut buf[..slice_len]);
-            let rust_str = core::str::from_utf8(&buf[..slice_len]).unwrap();
-            Symbol::new(env, rust_str)
+            let s = core::str::from_utf8(&buf[..slice_len]).unwrap();
+            Symbol::new(env, s)
         });
 
         let upgraded = Escrow {
@@ -3068,7 +3077,7 @@ impl CraftNexusContract {
             created_at: legacy.created_at,
             ipfs_hash: legacy.ipfs_hash,
             metadata_hash: legacy.metadata_hash,
-            dispute_reason: dispute_symbol, // Map to lightweight Symbol
+            dispute_reason: dispute_symbol,
             dispute_initiated_at: legacy.dispute_initiated_at,
             funded: true,
         };
@@ -3108,8 +3117,8 @@ impl CraftNexusContract {
             let slice_len = core::cmp::min(len, 32);
             let mut buf = [0u8; 32];
             r.copy_into_slice(&mut buf[..slice_len]);
-            let rust_str = core::str::from_utf8(&buf[..slice_len]).unwrap();
-            Symbol::new(env, rust_str)
+            let s = core::str::from_utf8(&buf[..slice_len]).unwrap();
+            Symbol::new(env, s)
         });
         let upgraded = Escrow {
             version: CURRENT_ESCROW_VERSION,
@@ -3150,8 +3159,8 @@ impl CraftNexusContract {
             let slice_len = core::cmp::min(len, 32);
             let mut buf = [0u8; 32];
             r.copy_into_slice(&mut buf[..slice_len]);
-            let rust_str = core::str::from_utf8(&buf[..slice_len]).unwrap();
-            Symbol::new(env, rust_str)
+            let s = core::str::from_utf8(&buf[..slice_len]).unwrap();
+            Symbol::new(env, s)
         });
 
         Escrow {

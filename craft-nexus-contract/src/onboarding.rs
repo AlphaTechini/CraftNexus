@@ -3,15 +3,13 @@
 //! Handles user registration (onboarding), role assignments, username configuration,
 //! profile management, and verification processes for buyers and artisans on the CraftNexus platform.
 
-#![allow(unexpected_cfgs)]
+
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, token, Address, Bytes, Env, Map, String, Symbol,
-    TryFromVal, Val, Vec,
+    contract, contracterror, contractimpl, contracttype, token, Address, Bytes, Env, Map, String,
+    Symbol, TryFromVal, Val, Vec,
 };
-
 extern crate alloc;
-use alloc::string::ToString;
 
 /// Standard TTL threshold for persistent storage (approx 14 hours at 5s ledger)
 const TTL_THRESHOLD: u32 = 10_000;
@@ -978,7 +976,16 @@ impl OnboardingContract {
         Self::migrate_legacy_verification_history(env, user);
 
         let count_key = DataKey::VerificationHistoryCount(user.clone());
-        let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
+        // [PERFORMANCE #94] Extend TTL on read so the count key does not expire while
+        // the buffer is still in active use. Without this bump a count entry close to
+        // its TTL deadline could be archived on the same ledger as the write that follows,
+        // silently resetting the history length to zero on the next call.
+        let count: u32 = if let Some(c) = env.storage().persistent().get(&count_key) {
+            Self::extend_persistent(env, &count_key);
+            c
+        } else {
+            0
+        };
 
         // [FEATURE #83] Circular-buffer rotation for active contracts:
         // When history is full, shift older entries down and append new entry at end.
@@ -1384,6 +1391,9 @@ impl OnboardingContract {
     /// assert!(!profile.is_verified);
     /// ```
     pub fn onboard_user(env: Env, user: Address, username: String, role: UserRole) -> UserProfile {
+        // [SECURITY] Endpoint #93: The registering user must prove ownership of the
+        // supplied address. Unauthorized invocation without a valid user signature is
+        // rejected before any state mutation.
         user.require_auth();
 
         // Validate role is valid (only Buyer or Artisan for self-onboarding)
@@ -1400,6 +1410,11 @@ impl OnboardingContract {
             .unwrap_or_else(|| env.panic_with_error(Error::NotInitialized));
         Self::extend_persistent(&env, &DataKey::Config);
 
+        // [SECURITY] Endpoint #93: Only verified platform roles may approve new user
+        // registrations. The platform admin must co-sign every onboarding transaction
+        // to prevent unauthorized state transitions.
+        config.platform_admin.require_auth();
+
         // Normalize the username (lowercase + trim whitespace)
         let normalized = normalize_username(&env, &username);
         
@@ -1407,8 +1422,8 @@ impl OnboardingContract {
         let username_len = core::cmp::min(normalized.len() as usize, 32);
         let mut user_buf = [0u8; 32];
         normalized.copy_into_slice(&mut user_buf[..username_len]);
-        let rust_str = core::str::from_utf8(&user_buf[..username_len]).unwrap();
-        let optimized_username = Symbol::new(&env, rust_str);
+        let s = core::str::from_utf8(&user_buf[..username_len]).unwrap();
+        let optimized_username = Symbol::new(&env, s);
         assert!(
             username_len >= config.min_username_length as usize,
             "Username too short"
@@ -1467,7 +1482,7 @@ impl OnboardingContract {
             version: CURRENT_USER_PROFILE_VERSION,
             address: user.clone(),
             role,
-            username: optimized_username,           
+            username: optimized_username,
             registered_at: env.ledger().timestamp(),
             is_verified: false,
             successful_trades: 0,
@@ -1587,8 +1602,12 @@ impl OnboardingContract {
     }
 
     /// Check if the user has any active escrows on the configured escrow contract.
+    ///
+    /// [FEATURE #51 / #452] The queried user must authorize this read.
     /// Returns false if no escrow contract is registered or if the user has no active escrows.
     pub fn has_active_contracts(env: Env, user: Address) -> bool {
+        user.require_auth();
+
         let config: OnboardingConfig = env
             .storage()
             .persistent()
@@ -1745,13 +1764,22 @@ impl OnboardingContract {
     /// Check if a user has completed onboarding.
     ///
     /// Returns `true` if a [`DataKey::UserProfile`] entry exists for `user`,
-    /// regardless of profile status or version. Does NOT extend TTL.
+    /// regardless of profile status or version.
+    ///
+    /// # Security — issue #438
+    /// This endpoint is now protected with `require_auth()` to prevent unauthorized
+    /// callers from querying onboarding status. Only the user themselves may invoke
+    /// this check - it is a privileged query.
+    ///
+    /// # Storage Optimization — issue #443
+    /// TTL extension is now applied on read to prevent premature archival of
+    /// user profiles during extended escrow lifecycles.
     ///
     /// # Parameters
     /// - `user`: `Address` — The wallet address to check.
     ///
     /// # Storage Side-Effects
-    /// - **Read** [`DataKey::UserProfile(user)`] — existence check only, no TTL extension.
+    /// - **Read** [`DataKey::UserProfile(user)`] — existence check with TTL extension.
     ///
     /// # Emitted Events
     /// None.
@@ -1759,6 +1787,7 @@ impl OnboardingContract {
     /// # Errors
     /// None — always returns a `bool`.
     pub fn is_onboarded(env: Env, user: Address) -> bool {
+        user.require_auth();
         let key = DataKey::UserProfile(user.clone());
         // Issue #423/#435: extend TTL on read to prevent storage expiry
         if env.storage().persistent().has(&key) {
@@ -2179,6 +2208,15 @@ impl OnboardingContract {
     ///
     /// Returns `false` for unknown addresses (no panic).
     ///
+    /// # Security — issue #450
+    /// This endpoint is now protected with `require_auth()` to prevent unauthorized
+    /// callers from querying verification status. Only the authenticated user may
+    /// invoke this check.
+    ///
+    /// # Storage Optimization — issue #443
+    /// TTL extension is applied on read to prevent premature archival during
+    /// extended escrow lifecycles.
+    ///
     /// # Parameters
     /// - `user`: `Address` — The address to check.
     ///
@@ -2191,7 +2229,14 @@ impl OnboardingContract {
     /// # Errors
     /// None.
     pub fn is_verified(env: Env, user: Address) -> bool {
-        if let Some(profile) = Self::try_get_user_profile(&env, user) {
+        user.require_auth();
+        let profile_key = DataKey::UserProfile(user.clone());
+        if let Some(profile) = env
+            .storage()
+            .persistent()
+            .get::<_, UserProfile>(&profile_key)
+        {
+            Self::extend_persistent(&env, &profile_key);
             profile.is_verified
         } else {
             false
